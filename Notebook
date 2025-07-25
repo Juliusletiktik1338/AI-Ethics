@@ -1,0 +1,200 @@
+import numpy as np
+import pandas as pd
+from aif360.datasets import StandardDataset
+from aif360.metrics import BinaryLabelDatasetMetric, ClassificationMetric
+from aif360.algorithms.preprocessing import Reweighing
+from aif360.algorithms.inprocessing import AdversarialDebiasing
+from aif360.algorithms.postprocessing import EqualizedOdds
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from IPython.display import Markdown, display # For displaying Markdown in notebooks
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# --- Configuration for the COMPAS dataset ---
+# COMPAS dataset is typically structured with 'race' as a sensitive attribute
+# and 'two_year_recid' as the favorable/unfavorable outcome (0=no recidivism, 1=recidivism)
+
+# Define sensitive attributes and favorable/unfavorable labels
+# In COMPAS, 'race' is the sensitive attribute. We'll focus on 'African-American' vs 'Caucasian'.
+# 'two_year_recid' is the outcome: 0 for no recidivism (favorable), 1 for recidivism (unfavorable).
+# We want to ensure fair prediction of *no recidivism*.
+privileged_groups = [{'race': 'Caucasian'}]
+unprivileged_groups = [{'race': 'African-American'}]
+label_names = ['two_year_recid']
+favorable_classes = [0] # 0 indicates no recidivism (favorable outcome)
+protected_attribute_names = ['race']
+
+# --- Simulated Data Loading (replace with actual loading if running locally) ---
+# In a real scenario, you would load the COMPAS dataset from a CSV or similar source.
+# For demonstration, we'll create a dummy DataFrame that mimics some characteristics.
+print("Simulating COMPAS dataset loading...")
+np.random.seed(42)
+data = {
+    'sex': np.random.choice(['Male', 'Female'], 1000),
+    'age_cat': np.random.choice(['Less than 25', '25 - 45', 'Greater than 45'], 1000),
+    'race': np.random.choice(['African-American', 'Caucasian', 'Hispanic', 'Other'], 1000, p=[0.5, 0.3, 0.1, 0.1]),
+    'priors_count': np.random.randint(0, 20, 1000),
+    'c_charge_degree': np.random.choice(['F', 'M'], 1000), # Felony or Misdemeanor
+    'decile_score': np.random.randint(1, 11, 1000), # COMPAS risk score
+    'two_year_recid': np.random.choice([0, 1], 1000, p=[0.6, 0.4]) # 0: No recidivism, 1: Recidivism
+}
+df = pd.DataFrame(data)
+
+# Introduce synthetic bias: Make African-Americans more likely to be predicted as recidivist
+# (i.e., higher decile_score and actual recidivism)
+df.loc[df['race'] == 'African-American', 'decile_score'] = np.clip(df.loc[df['race'] == 'African-American', 'decile_score'] + np.random.randint(1, 4, sum(df['race'] == 'African-American')), 1, 10)
+df.loc[df['race'] == 'African-American', 'two_year_recid'] = np.random.choice([0, 1], sum(df['race'] == 'African-American'), p=[0.4, 0.6])
+
+# Convert to AIF360's StandardDataset format
+dataset = StandardDataset(
+    df,
+    label_name=label_names[0],
+    favorable_classes=favorable_classes,
+    protected_attribute_names=protected_attribute_names,
+    privileged_classes=[['Caucasian']], # Note: privileged_classes expects a list of lists for each protected attribute
+    unprivileged_classes=[['African-American']],
+    features_to_drop=['decile_score'] # We'll use decile_score as our prediction later, not a feature
+)
+
+# Split data into train and test
+train_dataset, test_dataset = dataset.split([0.7], shuffle=True, seed=42)
+
+# Scale numerical features (important for Logistic Regression)
+scaler = StandardScaler()
+train_dataset.features = scaler.fit_transform(train_dataset.features)
+test_dataset.features = scaler.transform(test_dataset.features)
+
+# --- Train a baseline (biased) Logistic Regression Model ---
+print("\nTraining baseline Logistic Regression model...")
+model = LogisticRegression(solver='liblinear', random_state=42)
+model.fit(train_dataset.features, train_dataset.labels.ravel())
+
+# Make predictions
+test_pred_labels = model.predict(test_dataset.features)
+test_dataset_pred = test_dataset.copy(deepcopy=True)
+test_dataset_pred.labels = test_pred_labels
+
+# --- Evaluate Baseline Model Fairness ---
+print("\nEvaluating baseline model fairness...")
+metric_orig_test = ClassificationMetric(
+    test_dataset,
+    test_dataset_pred,
+    unprivileged_groups=unprivileged_groups,
+    privileged_groups=privileged_groups
+)
+
+# Disparity in False Positive Rates (FPR):
+# FPR = P(predicted=1 | actual=0) - higher for unprivileged means they are falsely flagged more often
+fpr_privileged_orig = metric_orig_test.false_positive_rate(privileged=True)
+fpr_unprivileged_orig = metric_orig_test.false_positive_rate(privileged=False)
+fpr_disparity_orig = metric_orig_test.false_positive_rate_difference()
+
+# Disparity in False Negative Rates (FNR):
+# FNR = P(predicted=0 | actual=1) - higher for privileged means they are falsely cleared more often
+fnr_privileged_orig = metric_orig_test.false_negative_rate(privileged=True)
+fnr_unprivileged_orig = metric_orig_test.false_negative_rate(privileged=False)
+fnr_disparity_orig = metric_orig_test.false_negative_rate_difference()
+
+# Accuracy
+accuracy_orig = metric_orig_test.accuracy()
+
+print(f"Baseline - FPR (Privileged): {fpr_privileged_orig:.4f}")
+print(f"Baseline - FPR (Unprivileged): {fpr_unprivileged_orig:.4f}")
+print(f"Baseline - FPR Difference (Unprivileged - Privileged): {fpr_disparity_orig:.4f}")
+print(f"Baseline - FNR (Privileged): {fnr_privileged_orig:.4f}")
+print(f"Baseline - FNR (Unprivileged): {fnr_unprivileged_orig:.4f}")
+print(f"Baseline - FNR Difference (Unprivileged - Privileged): {fnr_disparity_orig:.4f}")
+print(f"Baseline - Accuracy: {accuracy_orig:.4f}")
+
+# --- Remediation: Equalized Odds Post-processing ---
+# This technique aims to equalize true positive rates and false positive rates across groups.
+print("\nApplying Equalized Odds Post-processing...")
+# Need scores, not just binary predictions, for EqualizedOdds
+test_pred_scores = model.predict_proba(test_dataset.features)[:, 1] # Probability of being recidivist (class 1)
+test_dataset_pred_scores = test_dataset.copy(deepcopy=True)
+test_dataset_pred_scores.scores = test_pred_scores.reshape(-1, 1) # Reshape for AIF360
+
+# Apply EqualizedOdds
+eq_odds_reweigh = EqualizedOdds(
+    unprivileged_groups=unprivileged_groups,
+    privileged_groups=privileged_groups
+)
+eq_odds_reweigh = eq_odds_reweigh.fit(test_dataset, test_dataset_pred_scores)
+test_dataset_pred_reweighed = eq_odds_reweigh.predict(test_dataset_pred_scores)
+
+# --- Evaluate Post-remediation Model Fairness ---
+print("\nEvaluating post-remediation model fairness (Equalized Odds)...")
+metric_reweighed_test = ClassificationMetric(
+    test_dataset,
+    test_dataset_pred_reweighed,
+    unprivileged_groups=unprivileged_groups,
+    privileged_groups=privileged_groups
+)
+
+fpr_privileged_reweighed = metric_reweighed_test.false_positive_rate(privileged=True)
+fpr_unprivileged_reweighed = metric_reweighed_test.false_positive_rate(privileged=False)
+fpr_disparity_reweighed = metric_reweighed_test.false_positive_rate_difference()
+
+fnr_privileged_reweighed = metric_reweighed_test.false_negative_rate(privileged=True)
+fnr_unprivileged_reweighed = metric_reweighed_test.false_negative_rate(privileged=False)
+fnr_disparity_reweighed = metric_reweighed_test.false_negative_rate_difference()
+
+accuracy_reweighed = metric_reweighed_test.accuracy()
+
+print(f"Remediated - FPR (Privileged): {fpr_privileged_reweighed:.4f}")
+print(f"Remediated - FPR (Unprivileged): {fpr_unprivileged_reweighed:.4f}")
+print(f"Remediated - FPR Difference (Unprivileged - Privileged): {fpr_disparity_reweighed:.4f}")
+print(f"Remediated - FNR (Privileged): {fnr_privileged_reweighed:.4f}")
+print(f"Remediated - FNR (Unprivileged): {fnr_unprivileged_reweighed:.4f}")
+print(f"Remediated - FNR Difference (Unprivileged - Privileged): {fnr_disparity_reweighed:.4f}")
+print(f"Remediated - Accuracy: {accuracy_reweighed:.4f}")
+
+# --- Visualization (Conceptual, as actual plotting requires a display environment) ---
+print("\nGenerating conceptual visualizations (requires matplotlib/seaborn)...")
+
+# Data for plotting
+metrics_data = {
+    'Metric': ['FPR (Privileged)', 'FPR (Unprivileged)', 'FNR (Privileged)', 'FNR (Unprivileged)'],
+    'Baseline': [fpr_privileged_orig, fpr_unprivileged_orig, fnr_privileged_orig, fnr_unprivileged_orig],
+    'Remediated': [fpr_privileged_reweighed, fpr_unprivileged_reweighed, fnr_privileged_reweighed, fnr_unprivileged_reweighed]
+}
+metrics_df = pd.DataFrame(metrics_data)
+
+# Conceptual plot generation (will not display in this environment but shows the intent)
+plt.figure(figsize=(10, 6))
+sns.barplot(x='Metric', y='value', hue='variable', data=pd.melt(metrics_df, id_vars='Metric'))
+plt.title('Comparison of Fairness Metrics: Baseline vs. Remediated')
+plt.ylabel('Rate')
+plt.ylim(0, 1)
+plt.xticks(rotation=45, ha='right')
+plt.tight_layout()
+# plt.show() # Would show the plot if running in an interactive environment
+
+# --- Prepare data for report ---
+report_data = {
+    "Baseline": {
+        "FPR (Caucasian)": f"{fpr_privileged_orig:.2%}",
+        "FPR (African-American)": f"{fpr_unprivileged_orig:.2%}",
+        "FPR Difference": f"{fpr_disparity_orig:.2%}",
+        "FNR (Caucasian)": f"{fnr_privileged_orig:.2%}",
+        "FNR (African-American)": f"{fnr_unprivileged_orig:.2%}",
+        "FNR Difference": f"{fnr_disparity_orig:.2%}",
+        "Accuracy": f"{accuracy_orig:.2%}"
+    },
+    "Remediated (Equalized Odds)": {
+        "FPR (Caucasian)": f"{fpr_privileged_reweighed:.2%}",
+        "FPR (African-American)": f"{fpr_unprivileged_reweighed:.2%}",
+        "FPR Difference": f"{fpr_disparity_reweighed:.2%}",
+        "FNR (Caucasian)": f"{fnr_privileged_reweighed:.2%}",
+        "FNR (African-American)": f"{fnr_unprivileged_reweighed:.2%}",
+        "FNR Difference": f"{fnr_disparity_reweighed:.2%}",
+        "Accuracy": f"{accuracy_reweighed:.2%}"
+    }
+}
+
+# This `report_data` will be used to populate the Markdown report.
+# In a real scenario, the plots would also be saved and embedded.
+
+print("\nSimulated audit complete. Proceeding to generate report.")
